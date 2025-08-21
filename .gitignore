@@ -1,0 +1,6 @@
+# Ignore log files and artifacts
+*.log
+orphan_json/
+processed/
+__pycache__/
+*.pyc
