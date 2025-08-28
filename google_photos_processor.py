@@ -27,48 +27,43 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
+DEFAULT_TZ = "America/Los_Angeles"
 UTC = ZoneInfo("UTC")
 
 class GooglePhotosProcessor:
-    def __init__(self, base: Path, output: Path | None):
+    def __init__(self, base: Path, output: Path | None, time_zone: str = DEFAULT_TZ):
         self.base = base
         self.out_base = output if output else base / "processed"
         self.skipped: list[str] = []
         self.processed = 0
         self.copied_only = 0  # Files copied without metadata embedding
+        self.time_zone = ZoneInfo(time_zone)
         # For per-folder stats
         self._reset_folder_stats()
 
     def _reset_folder_stats(self):
+        from json_matcher import get_total_rule_count
         self.folder_processed = 0
         self.folder_copied_only = 0
         self.folder_skipped = 0
-        self.folder_rule_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0}
+        num_rules = get_total_rule_count()
+        self.folder_rule_counts = {i: 0 for i in range(1, num_rules + 1)}
     JSON_LENGTH_LIMIT = 50  # Max length of JSON filename (incl. .json)
-    MEDIA_EXTS = {
-        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
-        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp",
-        ".heic", ".heif",
-    }
     
     # Formats that ExifTool can write metadata to
     WRITABLE_FORMATS = {
-        ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".heic", ".heif",
-        ".mp4", ".mov", ".m4v", ".3gp"
+        ".360", ".3g2", ".3gp", ".aax", ".ai", ".arq", ".arw", ".avif",
+        ".cr2", ".cr3", ".crm", ".crw", ".cs1", ".dcp", ".dng", ".dr4",
+        ".dvb", ".eps", ".erf", ".exif", ".exv", ".f4a", ".f4v", ".fff",
+        ".flif", ".gif", ".glv", ".gpr", ".hdp", ".heic", ".heif", ".icc",
+        ".iiq", ".ind", ".insp", ".jng", ".jp2", ".jpeg", ".jpg", ".jxl",
+        ".lrv", ".m4a", ".m4v", ".mef", ".mie", ".mng", ".mos", ".mov",
+        ".mp4", ".mpo", ".mqv", ".mrw", ".nef", ".nksc", ".nrw", ".orf",
+        ".ori", ".pbm", ".pdf", ".pef", ".pgm", ".png", ".ppm", ".ps",
+        ".psb", ".psd", ".qtif", ".raf", ".raw", ".rw2", ".rwl", ".sr2",
+        ".srw", ".thm", ".tif", ".tiff", ".vrd", ".wdp", ".webp", ".x3f",
+        ".xmp"
     }
-    
-    # Formats that don't support metadata writing
-    READ_ONLY_FORMATS = {
-        ".avi", ".mkv", ".webm", ".gif", ".bmp"
-    }
-
-    def __init__(self, base: Path, output: Path | None):
-        self.base = base
-        self.out_base = output if output else base / "processed"
-        self.skipped: list[str] = []
-        self.processed = 0
-        self.copied_only = 0  # Files copied without metadata embedding
 
     # ---------- logging ----------
     def _setup_logging(self):
@@ -94,13 +89,12 @@ class GooglePhotosProcessor:
                 f.write(log_line + "\n")
 
     # ---------- utilities ----------
-    @staticmethod
-    def _json_time_to_pacific(ts: str | int) -> str:
-        """Convert Unix-timestamp-in-UTC → formatted Pacific-time string."""
+    def _json_time_to_local(self, ts: str | int) -> str:
+        """Convert Unix-timestamp-in-UTC → formatted local-time string."""
         try:
             dt_utc = datetime.fromtimestamp(int(ts), tz=UTC)
-            dt_pst = dt_utc.astimezone(PACIFIC)
-            return dt_pst.strftime("%Y:%m:%d %H:%M:%S")
+            dt_local = dt_utc.astimezone(self.time_zone)
+            return dt_local.strftime("%Y:%m:%d %H:%M:%S")
         except Exception:
             return ""
 
@@ -111,109 +105,19 @@ class GooglePhotosProcessor:
             if p.is_dir() and pat.match(p.name):
                 yield p
 
-    # ---------- JSON matching (unchanged logic) ----------
-    def _load_json(self, path: Path):
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            self.log_message("WARNING", f"Could not parse {path}: {e}")
-            return None
-
-    def _match_json(self, media: Path, json_files: list[Path]):
-        name = media.name
-        # Rule 1 - Exact match
-        exact = name + ".json"
-        for j in json_files:
-            if j.name.lower() == exact.lower():
-                self.log_message("INFO", f"JSON match - Rule 1 (direct): {name} → {j.name}")
-                self.folder_rule_counts[1] += 1
-                return [j]
-        # Rule 2 - Truncated match
-        if len(exact) > self.JSON_LENGTH_LIMIT:
-            trunc = name[: self.JSON_LENGTH_LIMIT - 5]
-            for j in json_files:
-                if j.name.lower().startswith(trunc.lower()):
-                    self.log_message("INFO", f"JSON match - Rule 2 (truncated): {name} → {j.name}")
-                    self.folder_rule_counts[2] += 1
-                    return [j]
-        # Rule 3 - Parenthetical match
-        m = re.match(r"^(.+)\((\d+)\)(\.[^.]+)$", name)
-        if m:
-            alt = f"{m.group(1)}{m.group(3)}({m.group(2)}).json"
-            for j in json_files:
-                if j.name.lower() == alt.lower():
-                    self.log_message("INFO", f"JSON match - Rule 3 (parenthetical): {name} → {j.name}")
-                    self.folder_rule_counts[3] += 1
-                    return [j]
-        # Rule 4 - Remove '-edited' from filename if present
-        edited_match = re.match(r"^(.*)-edited(\.[^.]+)$", name, re.IGNORECASE)
-        if edited_match:
-            base_name = edited_match.group(1) + edited_match.group(2)
-            rule4_json = base_name + ".json"
-            for j in json_files:
-                if j.name.lower() == rule4_json.lower():
-                    self.log_message("INFO", f"JSON match - Rule 4 (edited): {name} → {j.name}")
-                    self.folder_rule_counts[4] += 1
-                    return [j]
-        # Rule 5 - MP4/JPG or MP4/HEIC fallback
-        if name.lower().endswith('.mp4'):
-            base_name = name[:-4]
-            jpg_name = base_name + '.JPG'
-            jpg_json_name = jpg_name + '.json'
-            heic_name = base_name + '.HEIC'
-            heic_json_name = heic_name + '.json'
-            for j in json_files:
-                if j.name.lower() == jpg_json_name.lower():
-                    self.log_message("INFO", f"JSON match - Rule 5 (live photos): {name} → {j.name}")
-                    self.folder_rule_counts[5] = self.folder_rule_counts.get(5, 0) + 1
-                    return [j]
-            for j in json_files:
-                if j.name.lower() == heic_json_name.lower():
-                    self.log_message("INFO", f"JSON match - Rule 5 (live photos): {name} → {j.name}")
-                    self.folder_rule_counts[5] = self.folder_rule_counts.get(5, 0) + 1
-                    return [j]
-        # Rule 6 - (1).mp4/JPG or (1).mp4/HEIC fallback
-        m = re.match(r"^(.+)\(\d+\)\.mp4$", name, re.IGNORECASE)
-        if m:
-            base_name = m.group(1)
-            jpg_name = base_name + '.JPG'
-            jpg_json_name = jpg_name + '.json'
-            heic_name = base_name + '.HEIC'
-            heic_json_name = heic_name + '.json'
-            for j in json_files:
-                if j.name.lower() == jpg_json_name.lower():
-                    self.log_message("INFO", f"JSON match - Rule 6 (live photos duplicates): {name} → {j.name}")
-                    self.folder_rule_counts[6] = self.folder_rule_counts.get(6, 0) + 1
-                    return [j]
-            for j in json_files:
-                if j.name.lower() == heic_json_name.lower():
-                    self.log_message("INFO", f"JSON match - Rule 6 (live photos duplicates): {name} → {j.name}")
-                    self.folder_rule_counts[6] = self.folder_rule_counts.get(6, 0) + 1
-                    return [j]
-        # Rule 7 - PNG fallback (case insensitive)
-        png_match = re.match(r"^(.*)\.png$", name, re.IGNORECASE)
-        if png_match:
-            base_name = png_match.group(1)
-            png_json_name = base_name + ".json"
-            for j in json_files:
-                if j.name.lower() == png_json_name.lower():
-                    self.log_message("INFO", f"JSON match - Rule 7 (PNG): {name} → {j.name}")
-                    self.folder_rule_counts[7] = self.folder_rule_counts.get(7, 0) + 1
-                    return [j]
-        # Rule 8 - Title field fallback
-        for j in json_files:
-            data = self._load_json(j)
-            if data and data.get("title") == name:
-                self.log_message("INFO", f"JSON match - Rule 8 (via JSON title): {name} → {j.name}")
-                self.folder_rule_counts[8] = self.folder_rule_counts.get(8, 0) + 1
-                return [j]
-        return []
 
     # ---------- exiftool command ----------
     def _build_cmd(self, meta: dict, target_path: Path):
         """Build exiftool command for embedding metadata - FIXED VERSION"""
+        # Find exiftool executable (support exiftool(-k).exe and exiftool.exe)
+        import shutil
+        exiftool_path = shutil.which("exiftool.exe")
+        if not exiftool_path:
+            if shutil.which("exiftool(-k).exe"):
+                raise RuntimeError("Found exiftool(-k).exe, but this version is not supported for scripting. Please rename it to exiftool.exe and try again.")
+            raise RuntimeError("ExifTool executable not found. Please ensure exiftool.exe is in your PATH.")
         cmd = [
-            "exiftool",
+            exiftool_path,
             "-overwrite_original",
             "-q",
             "-m",
@@ -222,9 +126,9 @@ class GooglePhotosProcessor:
         # Dates
         date_str = ""
         if ts := meta.get("photoTakenTime", {}).get("timestamp"):
-            date_str = self._json_time_to_pacific(ts)
+            date_str = self._json_time_to_local(ts)
         elif ts := meta.get("creationTime", {}).get("timestamp"):
-            date_str = self._json_time_to_pacific(ts)
+            date_str = self._json_time_to_local(ts)
         if date_str:
             cmd += [
                 f"-DateTimeOriginal={date_str}",
@@ -260,13 +164,13 @@ class GooglePhotosProcessor:
 
     # ---------- processing ----------
     def _process_file(self, media: Path, jpath: Path, progress=None):
-        meta = self._load_json(jpath)
+        from json_matcher import load_json
+        meta = load_json(jpath, log_func=self.log_message)
         if not meta:
             self.skipped.append(str(media))
             self.folder_skipped += 1
             self.log_message("WARNING", f"Skip {media.name} (bad JSON)", progress=progress)
             return
-        
         # Determine target subdir from Pacific date
         ts = meta.get("photoTakenTime", {}).get("timestamp") or meta.get("creationTime", {}).get("timestamp")
         if not ts:
@@ -274,25 +178,21 @@ class GooglePhotosProcessor:
             self.folder_skipped += 1
             self.log_message("WARNING", f"Skip {media.name} (no timestamp)", progress=progress)
             return
-        
-        dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(PACIFIC)
+        dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(self.time_zone)
         target_dir = self.out_base / str(dt.year) / f"{dt.month:02d}"
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / media.name
-        
         # Copy file to destination first
         shutil.copy2(media, target)
-        
         # Check if this format supports metadata writing
         file_ext = media.suffix.lower()
-        
-        if file_ext in self.READ_ONLY_FORMATS:
+        if file_ext not in self.WRITABLE_FORMATS:
             # For formats that don't support metadata, update modified date using os.utime
             try:
                 # Get Pacific time as datetime object
-                pacific_dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(PACIFIC)
+                local_dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(self.time_zone)
                 # Convert to timestamp (seconds since epoch)
-                mod_time = pacific_dt.timestamp()
+                mod_time = local_dt.timestamp()
                 # Set both access and modified time
                 import os
                 os.utime(target, (mod_time, mod_time))
@@ -309,7 +209,7 @@ class GooglePhotosProcessor:
             # Try to embed metadata for supported formats
             cmd = self._build_cmd(meta, target)
             res = subprocess.run(cmd, capture_output=True, text=True)
-            
+
             if res.returncode == 0:
                 self.processed += 1
                 self.folder_processed += 1
@@ -319,10 +219,13 @@ class GooglePhotosProcessor:
                 self.folder_copied_only += 1
                 if hasattr(self, 'copied_only_files'):
                     self.copied_only_files.append(str(media))
+                # Log ExifTool error output for debugging
+                error_output = res.stderr.strip() if res.stderr else "No error output."
+                self.log_message("ERROR", f"ExifTool failed for {media.name}: {error_output}", progress=progress)
                 # Update modified time for copied only files (even for writable formats)
                 try:
-                    pacific_dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(PACIFIC)
-                    mod_time = pacific_dt.timestamp()
+                    local_dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(self.time_zone)
+                    mod_time = local_dt.timestamp()
                     import os
                     os.utime(target, (mod_time, mod_time))
                     self.log_message("WARNING", f"Updated modified date only (metadata embedding failed): {media.name} → {dt.year}/{dt.month:02d}", progress=progress)
@@ -344,8 +247,8 @@ class GooglePhotosProcessor:
                     self.copied_only_files.append(str(media))
                 # Update modified time for copied only files (unknown formats)
                 try:
-                    pacific_dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(PACIFIC)
-                    mod_time = pacific_dt.timestamp()
+                    local_dt = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(self.time_zone)
+                    mod_time = local_dt.timestamp()
                     import os
                     os.utime(target, (mod_time, mod_time))
                     self.log_message("INFO", f"Updated modified date for copied only file: {media.name} → {dt.year}/{dt.month:02d}", progress=progress)
@@ -355,9 +258,10 @@ class GooglePhotosProcessor:
 
     def _process_folder(self, year_folder: Path, process_files_set=None):
         from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+        from datetime import timedelta
         # Use self.console for both progress and logging
         json_files = list(year_folder.rglob("*.json"))
-        media_files = [p for p in year_folder.rglob("*") if p.suffix.lower() in self.MEDIA_EXTS]
+        media_files = [p for p in year_folder.rglob("*") if p.suffix.lower() != ".json"]
 
         # If process_files_set is specified, filter media_files by file name only
         if process_files_set is not None:
@@ -386,31 +290,44 @@ class GooglePhotosProcessor:
         logging.basicConfig(handlers=[RichLoggingHandler()], level=logging.INFO, format='%(asctime)s %(levelname)s | %(message)s', force=True)
 
         progress_label = f"{year_str} Processing" if year_str else "Processing"
+        def format_time_remaining(seconds):
+            if seconds is None or seconds < 0:
+                return "N/A"
+            from datetime import timedelta
+            return str(timedelta(seconds=int(seconds)))
+
         with Progress(
             TextColumn("{task.description}"),
             BarColumn(),
             "[progress.percentage]{task.percentage:>3.1f}%",
-            "{task.completed}/{task.total}",
-            TimeRemainingColumn(),
+            TextColumn("| Files processed: {task.completed}/{task.total} | Time remaining: {task.fields[time_fmt]}", justify="left", style="progress.remaining"),
             console=self.console,
-            transient=False
+            transient=False,
         ) as progress:
-            task = progress.add_task(progress_label, total=total_files)
+            task = progress.add_task(progress_label, total=total_files, time_fmt="N/A")
+            from json_matcher import match_json
             for media in media_files:
-                matches = self._match_json(media, json_files)
+                matches = match_json(media, json_files, log_func=self.log_message, rule_counts=self.folder_rule_counts)
                 if len(matches) == 1:
                     self._process_file(media, matches[0], progress=progress)
                 else:
                     self.skipped.append(str(media))
                     self.folder_skipped += 1
                     self.log_message("WARNING", f"Skip {media.name} (no or multi JSON)", progress=progress)
-                progress.update(task, advance=1)
+                # Update time remaining field
+                current_task = progress.tasks[task]
+                progress.update(task, advance=1, time_fmt=format_time_remaining(current_task.time_remaining))
 
     # ---------- run ----------
     def run(self):
         self._setup_logging()
-        if shutil.which("exiftool") is None:
-            self.log_message("ERROR", "ExifTool not found in PATH")
+        # Check for exiftool.exe only
+        import shutil
+        if not shutil.which("exiftool.exe"):
+            if shutil.which("exiftool(-k).exe"):
+                self.log_message("ERROR", "Please exiftool(-k).exe, please rename to exiftool.exe and try again.")
+            else:
+                self.log_message("ERROR", "ExifTool not found in PATH. Please ensure exiftool.exe is available.")
             return 1
 
         self.out_base.mkdir(parents=True, exist_ok=True)
@@ -459,8 +376,11 @@ class GooglePhotosProcessor:
                 self.log_message("INFO", f"  Processed with metadata: {self.folder_processed}")
                 self.log_message("INFO", f"  Copied only: {self.folder_copied_only}")
                 self.log_message("INFO", f"  Skipped: {self.folder_skipped}")
-                for rule_num in range(1, 9):
-                    self.log_message("INFO", f"  Rule {rule_num} matches: {self.folder_rule_counts.get(rule_num, 0)}")
+                from json_matcher import get_rule_description, get_total_rule_count
+                num_rules = get_total_rule_count()
+                for rule_num in range(1, num_rules + 1):
+                    desc = get_rule_description(rule_num)
+                    self.log_message("INFO", f"  Rule {rule_num} ({desc}) match count: {self.folder_rule_counts.get(rule_num, 0)}")
         total_skipped = sum(len(v) for v in skipped_by_year.values())
         total_copied_only = sum(len(v) for v in copied_only_by_year.values())
         self.log_message("INFO", f"COMPLETED PROCESSING. Total processed with metadata={self.processed}  Copied only (no metadata update)={self.copied_only}  Skipped={total_skipped}")
@@ -487,14 +407,16 @@ Arguments:
     ap.add_argument("input_path", help="Google Photos takeout folder")
     ap.add_argument("-o", "--output", help="Output folder")
     ap.add_argument("--skipped_files", help="Path to folder containing per-year skipped files txt")
+    ap.add_argument("--time-zone", default=DEFAULT_TZ, help="Time zone for conversions (default: America/Los_Angeles)")
     args = ap.parse_args()
     base = Path(args.input_path).expanduser().resolve()
     output = Path(args.output).expanduser().resolve() if args.output else None
     skipped_files_folder = Path(args.skipped_files).expanduser().resolve() if args.skipped_files else None
+    time_zone = args.time_zone
     if skipped_files_folder and base == skipped_files_folder:
         print("Error: input_path and skipped_files folder cannot be the same.")
         sys.exit(1)
-    proc = GooglePhotosProcessor(base, output)
+    proc = GooglePhotosProcessor(base, output, time_zone)
     proc._skipped_files_folder = skipped_files_folder
     sys.exit(proc.run())
 

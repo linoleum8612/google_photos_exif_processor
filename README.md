@@ -1,5 +1,3 @@
-
-
 # Google Photos Takeout EXIF Processor
 
 This project provides a set of scripts for processing EXIF metadata for Google Photos Takeout exports on Windows. The main processor script organizes your exported media into YYYY/MM, embeds metadata from JSON sidecar files—including creation date (in pacific time) and people tags—into supported image and video formats. The validator script checks the processed output for missing files and validates file sizes to help ensure your export was handled correctly. These tools are designed to help you preserve important metadata and maintain the integrity of your photo library during migration or archival.
@@ -16,7 +14,7 @@ This section provides a step-by-step guide to help you get started with the Goog
 Before running the scripts, ensure you have the following installed:
 
 - **Python 3.9 or higher**
-- **ExifTool**: Download from [ExifTool](https://exiftool.org/), extract `exiftool(-k).exe`, rename it to `exiftool.exe`, and place it in your PATH (e.g., `C:\Windows` or your project folder).
+- **ExifTool**: Download from [ExifTool](https://exiftool.org/), extract the zip, rename `exiftool(-k).exe` to `exiftool.exe`, and place it in your PATH (e.g., `C:\Windows` or your project folder).
 - **tzdata** and **rich** Python packages:
 
     ```powershell
@@ -36,13 +34,14 @@ If you omit the `-o` flag, processed files will be placed in a `processed` subfo
 ### 3. Validating the Output
 
 
+
 After processing, run the validator script to check for missing files and compare file sizes:
 
 ```powershell
-python validate.py "C:\Path\To\Takeout" [-o "C:\Path\To\Processed"]
+python validate.py "C:\Path\To\Takeout" [-o "C:\Path\To\Processed"] [--time-zone "America/New_York"]
 ```
 
-If you omit the `-o` flag, the validator will look for output in the default `processed` subfolder.
+If you omit the `-o` flag, the validator will look for output in the default `processed` subfolder. If you omit the `--time-zone` flag, the validator will use Pacific Time (`America/Los_Angeles`) by default. You can specify any valid IANA time zone name for date conversion.
 
 ---
 
@@ -106,26 +105,27 @@ processed\
 - **Read-Only Format Handling**: For formats that do not support metadata writing (e.g., AVI, MKV, GIF, BMP, WEBM):
     - The file is still copied to the output folder.
     - The file's modified date is updated to match the Pacific Time date from the JSON (using Windows-compatible Python code).
-- **Rule-Based JSON Matching**: Due to the unreliable and non-standard naming of JSON sidecar files in Google Takeout, matching them to their corresponding media files is a significant challenge and source of frustration. This script uses a series of rules to work around these inconsistencies:
-    1. **Exact match**: `<filename>.<ext>.json`
-    2. **Truncated match**: Handles long filenames (Google truncates JSON names at 50 chars)
-    3. **Parenthetical match**: Handles files like `IMG(1).jpg` and their JSONs
-    4. **Edited filename match**: Handles `-edited` suffixes
-    5. **Live photo fallback**: Matches MP4s to JPG/HEIC JSONs
-    6. **Duplicate live photo fallback**: Handles `(1).mp4` to JPG/HEIC JSONs
-    7. **PNG fallback**: Handles PNGs with matching JSONs
-    8. **Title-based match**: Uses the `title` field in JSON for matching
+    - **Rule-Based JSON Matching**: Due to the unreliable and non-standard naming of JSON sidecar files in Google Takeout, matching them to their corresponding media files is a significant challenge and source of frustration. This script uses a series of rules to work around these inconsistencies:
+        1. **Direct match**: `<filename>.<ext>.json` (JSON file matches media filename exactly)
+        2. **Truncated match**: Handles long filenames
+        3. **Parenthetical match**: Handles files like `IMG(1).jpg` and their JSONs
+        4. **Edited filename match**: Handles `-edited` suffixes
+        5. **Live photo**: Matches MP4s for live photos
+        6. **Duplicate live photos**: Handles `(1).mp4` from live photos
+        7. **Title-based match**: Uses the `title` field in JSON for matching
+        8. **Base filename match**: Matches any JSON file starting with the base filename (without extension), e.g. for `0.png` matches `0.supplemental-metadata.json`, `0.json`, etc.
+        9. **Other custom rules**: You can add more rules as needed for edge cases by editing `json_matcher.py`.
 - **Logging**: All console output is mirrored to a timestamped log file in the input folder, providing a complete record of the processing session. For each year, the script also writes summary statistics and lists of files that were either skipped or processed as "copied-only" to separate text files. 
     - **Copied-only files** are files that could not have metadata embedded (either due to format limitations or errors during embedding) and were only copied to the output folder with their modified date updated. These files are tracked and reported so you can review which files may lack full metadata.
 - **Error Handling**: Skipped files (missing JSON, bad JSON, ambiguous matches, missing date) are logged for review.
 - **Optional Flags**:
     - `-o <output_folder>`: Specify a custom output folder (default: `<takeout_folder>/processed`)
     - `--skipped_files <skipped_files_folder>`: Retry processing files listed in per-year skipped files text files. Files are marked as skipped if they could not be matched with any JSON sidecar file using the available rules. You can manually review these edge cases, add new matching rules to the script if needed, and then rerun the processor with this option to attempt processing only the previously skipped files.
-
+    - `--time-zone "<time_zone>"`: Specify the time zone for date/time conversions in TZ identifier format. The value should be a valid [IANA time zone name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), e.g., `America/New_York`, `Asia/Kolkata`, etc. Default is `America/Los_Angeles` (Pacific Time).
 #### Usage Example
 
 ```powershell
-python google_photos_processor.py "C:\Path\To\Takeout" -o "C:\Path\To\Output" --skipped_files "C:\Path\To\SkippedFilesFolder"
+python google_photos_processor.py "C:\Path\To\Takeout" -o "C:\Path\To\Output" --skipped_files "C:\Path\To\SkippedFilesFolder" --time-zone "Europe/London"
 ```
 
 ---
@@ -144,15 +144,16 @@ python google_photos_processor.py "C:\Path\To\Takeout" -o "C:\Path\To\Output" --
 **Test 4: Orphan JSON Detection**
     - Identifies JSON files not matched to any media file. This is another major pain point with Google Takeout—sometimes a JSON sidecar file will exist, but the actual media file it references is missing from the export. In these cases, the script extracts the Google Photos URL from the orphaned JSON so you can manually download the missing media and then reprocess it. This helps recover important photos or videos that would otherwise be lost due to Takeout's inconsistencies.
 
+
 **Optional Flags**:
     - `-o <output_folder>`: Specify a custom processed output folder (default: `<takeout_folder>/processed`)
     - `--wait`: Pause after each year summary for review
-
+    - `--time-zone "<time_zone>"`: Specify the time zone for date/time conversions in TZ identifier format. The value should be a valid [IANA time zone name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), e.g., `America/New_York`, `Asia/Kolkata`, etc. Default is `America/Los_Angeles` (Pacific Time).
 
 #### Usage Example
 
 ```powershell
-python validate.py "C:\Path\To\Takeout" -o "C:\Path\To\Processed" --wait
+python validate.py "C:\Path\To\Takeout" -o "C:\Path\To\Processed" --wait --time-zone "Europe/London"
 ```
 
 ---
@@ -167,7 +168,7 @@ If you see:
 Error: ExifTool not found in PATH
 ```
 
-**Solution**: Download `exiftool.exe` and add it to your PATH or place it in the project folder.
+**Solution**: Ensure `exiftool.exe` is added to the PATH variable. If you only have `exiftool(-k).exe`, rename it to `exiftool.exe`.
 
 **Permission Errors**
 
@@ -194,7 +195,7 @@ If you see Unicode errors, the script will skip problematic files and log them.
 - **Non-destructive**: Originals are never modified; all processing is done on copies.
 - **Retry-able**: You can re-run the processor for skipped files after adding additional JSON matching rules.
 - **Detailed Logging**: All actions are logged for audit and troubleshooting.
-- **Performance**: Typical speed is 1-3 files/sec, depending on file size and disk speed. Large videos may take longer.
+- **Performance**: Typical speed is 1-3 files/sec when reading and writing to same storage drive. Use different source and target drives for better performance.
 
 ---
 
@@ -208,7 +209,6 @@ If you see Unicode errors, the script will skip problematic files and log them.
 
 ### Limitations
 
-- **ExifTool dependency**: Requires `exiftool.exe` in your PATH.
 - **Complex filename patterns**: Some edge cases may not match perfectly; review logs for skipped files.
 - **Video metadata**: Some video formats have limited EXIF support; for read-only formats, only the modified date is updated.
 - **Windows path length**: Avoid very long folder paths to prevent errors.

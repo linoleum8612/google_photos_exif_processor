@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import json
+from json_matcher import load_json, match_json
 import logging
 import re
 import sys
@@ -29,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
+DEFAULT_TZ = "America/Los_Angeles"
 UTC = ZoneInfo("UTC")
 
 class ValidationResult:
@@ -41,20 +42,22 @@ class ValidationResult:
         self.missing_files = []
         self.mismatch_files = []  # Now stores (input_file, output_file, reason)
         self.errors = []
+        self.invalid_date_files = 0  # Aggregate count
+        self.orphan_json_files = 0  # Aggregate count
 
 class GooglePhotosValidator:
+    def _find_json_for_media(self, media_file: Path, json_files: list[Path]):
+        """Find the best matching JSON file for a given media file using match_json rules."""
+        from json_matcher import match_json
+        matches = match_json(media_file, json_files)
+        return matches[0] if matches else None
     JSON_LENGTH_LIMIT = 50  # Max length of JSON filename (incl. .json)
-    MEDIA_EXTS = {
-        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
-        ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp",
-        ".heic", ".heif",
-    }
 
-    def __init__(self, base_path: Path, output_path: Path = None):
+    def __init__(self, base_path: Path, output_path: Path = None, time_zone: str = DEFAULT_TZ):
         self.base_path = base_path
         self.output_path = output_path or (base_path / "processed")
         self.result = ValidationResult()
-        
+        self.time_zone = ZoneInfo(time_zone)
         # Setup logging to both console and file
         self._setup_logging()
 
@@ -94,106 +97,19 @@ class GooglePhotosValidator:
                 if match:
                     yield item, match.group(1)
 
-    def _load_json(self, json_path: Path):
-        """Load JSON metadata file"""
-        try:
-            return json.loads(json_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            logging.warning("Could not parse %s: %s", json_path, e)
-            return None
-
-    def _find_json_for_media(self, media_file: Path, json_files: list[Path]):
-        """Find matching JSON file for a media file using the same logic as the processor"""
-        media_name = media_file.name
-
-        # Rule 1: Exact match (case insensitive)
-        exact_json = media_name + ".json"
-        for json_file in json_files:
-            if json_file.name.lower() == exact_json.lower():
-                return json_file
-
-        # Rule 2: Truncated match (50 char limit, case insensitive)
-        if len(exact_json) > self.JSON_LENGTH_LIMIT:
-            truncated = media_name[:self.JSON_LENGTH_LIMIT - 5]
-            for json_file in json_files:
-                if json_file.name.lower().startswith(truncated.lower()) and json_file.name.lower().endswith('.json'):
-                    json_base = json_file.name[:-5]
-                    if media_name.lower().startswith(json_base.lower()):
-                        return json_file
-
-        # Rule 3: Parenthetical match (case insensitive)
-        match = re.match(r'^(.+)\((\d+)\)(\.[^.]+)$', media_name)
-        if match:
-            base_name, number, extension = match.groups()
-            alt_json = f"{base_name}{extension}({number}).json"
-            for json_file in json_files:
-                if json_file.name.lower() == alt_json.lower():
-                    return json_file
-
-        # Rule 4: Check for '-edited' from filename if present (case insensitive)
-        edited_match = re.match(r"^(.*)-edited(\.[^.]+)$", media_name, re.IGNORECASE)
-        if edited_match:
-            base_name = edited_match.group(1) + edited_match.group(2)
-            rule4_json = base_name + ".json"
-            for json_file in json_files:
-                if json_file.name.lower() == rule4_json.lower():
-                    return json_file
-
-        # Rule 5 - Live photos (JPG or HEIC fallback, case insensitive)
-        if media_name.lower().endswith('.mp4'):
-            base_name = media_name[:-4]
-            jpg_name = base_name + '.JPG'
-            jpg_json_name = jpg_name + '.json'
-            heic_name = base_name + '.HEIC'
-            heic_json_name = heic_name + '.json'
-            for json_file in json_files:
-                if json_file.name.lower() == jpg_json_name.lower():
-                    return json_file
-            for json_file in json_files:
-                if json_file.name.lower() == heic_json_name.lower():
-                    return json_file
-
-        # Rule 6 - (1).mp4/JPG or (1).mp4/HEIC fallback (live photo duplicates)
-        m = re.match(r"^(.+)\(\d+\)\.mp4$", media_name, re.IGNORECASE)
-        if m:
-            base_name = m.group(1)
-            jpg_name = base_name + '.JPG'
-            jpg_json_name = jpg_name + '.json'
-            heic_name = base_name + '.HEIC'
-            heic_json_name = heic_name + '.json'
-            for json_file in json_files:
-                if json_file.name.lower() == jpg_json_name.lower():
-                    return json_file
-            for json_file in json_files:
-                if json_file.name.lower() == heic_json_name.lower():
-                    return json_file
-        # Rule 7: PNG fallback (case insensitive)
-        png_match = re.match(r"^(.*)\.png$", media_name, re.IGNORECASE)
-        if png_match:
-            base_name = png_match.group(1)
-            png_json_name = base_name + ".json"
-            for json_file in json_files:
-                if json_file.name.lower() == png_json_name.lower():
-                    return json_file
-
-        # Rule 8: Title-based match
-        for json_file in json_files:
-            metadata = self._load_json(json_file)
-            if metadata and metadata.get('title') == media_name:
-                return json_file
-        return None
 
     def _get_expected_output_path(self, media_file: Path, json_files: list[Path]):
         """Determine where this media file should be in the processed output"""
-        json_file = self._find_json_for_media(media_file, json_files)
+        matches = match_json(media_file, json_files)
+        json_file = matches[0] if matches else None
         if not json_file:
             return None
 
-        metadata = self._load_json(json_file)
+        metadata = load_json(json_file)
         if not metadata:
             return None
 
-        # Get timestamp and convert to Pacific time (same logic as processor)
+        # Get timestamp and convert to input time zone 
         timestamp = None
         for time_field in ['photoTakenTime', 'creationTime']:
             if time_field in metadata:
@@ -205,12 +121,11 @@ class GooglePhotosValidator:
             return None
 
         try:
-            # Convert UTC timestamp to Pacific time
+            # Convert UTC timestamp to specified time zone
             dt_utc = datetime.fromtimestamp(int(timestamp), tz=UTC)
-            dt_pacific = dt_utc.astimezone(PACIFIC)
-            
+            dt_local = dt_utc.astimezone(self.time_zone)
             # Expected path: output/YYYY/MM/filename
-            expected_path = self.output_path / str(dt_pacific.year) / f"{dt_pacific.month:02d}" / media_file.name
+            expected_path = self.output_path / str(dt_local.year) / f"{dt_local.month:02d}" / media_file.name
             return expected_path
         except (ValueError, TypeError):
             return None
@@ -254,12 +169,13 @@ class GooglePhotosValidator:
         year_logger.info("Processing folder: %s", year_folder.name)
 
         # Collect media files and JSON files
+        print(f"Scanning all files in '{year_folder.name}' (this may take a few seconds)...")
         media_files = []
         json_files = []
 
         for file_path in year_folder.rglob('*'):
             if file_path.is_file():
-                if file_path.suffix.lower() in self.MEDIA_EXTS:
+                if file_path.suffix.lower() != ".json":
                     media_files.append(file_path)
                 elif file_path.suffix.lower() == '.json':
                     json_files.append(file_path)
@@ -281,9 +197,9 @@ class GooglePhotosValidator:
                     expected_year = int(year)
                     expected_month = int(month_folder.name)
                     for file in month_folder.iterdir():
-                        if file.is_file() and file.suffix.lower() in self.MEDIA_EXTS:
+                        if file.is_file() and file.suffix.lower() != ".json":
                             try:
-                                mtime = datetime.fromtimestamp(file.stat().st_mtime, tz=PACIFIC)
+                                mtime = datetime.fromtimestamp(file.stat().st_mtime, tz=self.time_zone)
                                 if mtime.year != expected_year or mtime.month != expected_month:
                                     invalid_date_files.append(str(file))
                             except Exception:
@@ -347,6 +263,14 @@ class GooglePhotosValidator:
                 for fname in invalid_date_files:
                     f.write(f"{fname}\n")
             year_logger.info(f"Invalid date files written to: {invalid_date_log}")
+        # Aggregate count for overall summary
+        self.result.invalid_date_files += len(invalid_date_files)
+
+        # Track per-year missing files for overall summary
+        if not hasattr(self.result, 'per_year_missing_files'):
+            self.result.per_year_missing_files = []
+        missing_files = [m for m in media_files if not self._get_expected_output_path(m, json_files) or not (self._get_expected_output_path(m, json_files) and self._get_expected_output_path(m, json_files).exists())]
+        self.result.per_year_missing_files.extend(str(m) for m in missing_files)
 
         # Write missing files for this year
         not_present_file = self.base_path / f"{year}_validation_result_not_present.txt"
@@ -407,16 +331,26 @@ class GooglePhotosValidator:
                         year_logger.info(f"Copied orphan JSON {src_path} to {dest_path}")
                 except Exception as e:
                     year_logger.warning(f"Failed to copy orphan JSON {orphan}: {e}")
+        # Aggregate count for overall summary
+        self.result.orphan_json_files += len(orphan_jsons)
 
         # Print per-year summary (improved format)
         label_width = 38
         value_width = 6
-        print(f"\nYEAR {year} SUMMARY:")
-        print(f"  Total media files:{' ' * (label_width - len('Total media files:'))}{len(media_files):>{value_width}}")
-        print(f"  Test 1: Output files not present:{' ' * (label_width - len('Test 1: Output files not present:'))}{len([m for m in media_files if not self._get_expected_output_path(m, json_files)]):>{value_width}}")
-        print(f"  Test 2: Output file size mismatch:{' ' * (label_width - len('Test 2: Output file size mismatch:'))}{len(mismatched_files):>{value_width}}")
-        print(f"  Test 3: Output file modified date invalid:{' ' * (label_width - len('Test 3: Output file modified date invalid:'))}{len(invalid_date_files):>{value_width}}")
-        print(f"  Test 4: Orphan JSON files:{' ' * (label_width - len('Test 4: Orphan JSON files:'))}{len(orphan_jsons):>{value_width}}")
+        year_summary_lines = []
+        year_summary_lines.append(f"\nYEAR {year} SUMMARY:")
+        year_summary_lines.append(f"  Total media files:{' ' * (label_width - len('Total media files:'))}{len(media_files):>{value_width}}")
+        year_summary_lines.append(f"  Test 1: Output files not present:{' ' * (label_width - len('Test 1: Output files not present:'))}{len(missing_files):>{value_width}}")
+        year_summary_lines.append(f"  Test 2: Output file size mismatch:{' ' * (label_width - len('Test 2: Output file size mismatch:'))}{len(mismatched_files):>{value_width}}")
+        year_summary_lines.append(f"  Test 3: Output file modified date invalid:{' ' * (label_width - len('Test 3: Output file modified date invalid:'))}{len(invalid_date_files):>{value_width}}")
+        year_summary_lines.append(f"  Test 4: Orphan JSON files:{' ' * (label_width - len('Test 4: Orphan JSON files:'))}{len(orphan_jsons):>{value_width}}")
+        for line in year_summary_lines:
+            print(line)
+        # Write per-year summary to text file
+        year_summary_file = self.base_path / f"{year}_validation_summary.txt"
+        with open(year_summary_file, 'w', encoding='utf-8') as f:
+            for line in year_summary_lines:
+                f.write(line + "\n")
 
         # Pause for user input after each year only if wait is True
         if wait:
@@ -472,67 +406,26 @@ class GooglePhotosValidator:
         return True
 
     def _print_summary(self):
-        """Print validation summary"""
-        summary_lines = [
-            "\n" + "=" * 70,
-            "VALIDATION SUMMARY (File Size Comparison)",
-            "=" * 70,
-            f"Total input media files:     {self.result.total_input_files}",
-            f"Found in output:             {self.result.found_in_output}",
-            f"Missing files:               {len(self.result.missing_files)}",
-            f"Size matches:                {self.result.content_matches}",
-            f"Size mismatches:             {self.result.content_mismatches}",
-            f"Errors:                      {len(self.result.errors)}"
-        ]
-        
+        """Print validation summary (no timestamps, at end only)"""
+        # Print improved overall summary (aligned, descriptive, no timestamps)
+        # Use fixed column for numbers (col 42)
+        label_width = 40
+        value_col = 42
+        def pad(label):
+            return ' ' * (value_col - len(label))
+        print("\n" + "=" * 70)
+        print("OVERALL VALIDATION SUMMARY:")
+        print("=" * 70)
+        print(f"  Total media files:{pad('Total media files:')}{self.result.total_input_files}")
+        print(f"  Test 1: Output files not present:{pad('Test 1: Output files not present:')}{len(self.result.missing_files)}")
+        print(f"  Test 2: Output file size mismatch:{pad('Test 2: Output file size mismatch:')}{self.result.content_mismatches}")
+        print(f"  Test 3: Output file modified date invalid:{pad('Test 3: Output file modified date invalid:')}{self.result.invalid_date_files}")
+        print(f"  Test 4: Orphan JSON files:{pad('Test 4: Orphan JSON files:')}{self.result.orphan_json_files}")
+        print(f"  Errors:{pad('Errors:')}{len(self.result.errors)}")
         if self.result.total_input_files > 0:
             success_rate = (self.result.content_matches / self.result.total_input_files) * 100
-            summary_lines.append(f"Success rate:                {success_rate:.1f}%")
-
-        for line in summary_lines:
-            print(line)
-            logging.info(line.replace("=" * 70, "").strip())
-
-        if self.result.missing_files:
-            print(f"\nMISSING FILES ({len(self.result.missing_files)}):")
-            logging.info("MISSING FILES (%d):", len(self.result.missing_files))
-            for i, missing in enumerate(self.result.missing_files[:10]):  # Show first 10
-                print(f"  - {missing}")
-                logging.info("  Missing: %s", missing)
-            if len(self.result.missing_files) > 10:
-                remaining = len(self.result.missing_files) - 10
-                print(f"  ... and {remaining} more")
-                logging.info("  ... and %d more", remaining)
-
-        if self.result.mismatch_files:
-            print(f"\nSIZE MISMATCHES ({len(self.result.mismatch_files)}):")
-            logging.info("SIZE MISMATCHES (%d):", len(self.result.mismatch_files))
-            for i, (input_file, output_file, reason) in enumerate(self.result.mismatch_files[:5]):  # Show first 5
-                print(f"  - Input:  {input_file}")
-                print(f"    Output: {output_file}")
-                print(f"    Reason: {reason}")
-                logging.info("  Mismatch - Input: %s", input_file)
-                logging.info("  Mismatch - Output: %s", output_file)
-                logging.info("  Mismatch - Reason: %s", reason)
-            if len(self.result.mismatch_files) > 5:
-                remaining = len(self.result.mismatch_files) - 5
-                print(f"  ... and {remaining} more")
-                logging.info("  ... and %d more", remaining)
-
-        if self.result.errors:
-            print(f"\nERRORS ({len(self.result.errors)}):")
-            logging.info("ERRORS (%d):", len(self.result.errors))
-            for error in self.result.errors[:5]:  # Show first 5
-                print(f"  - {error}")
-                logging.info("  Error: %s", error)
-            if len(self.result.errors) > 5:
-                remaining = len(self.result.errors) - 5
-                print(f"  ... and {remaining} more")
-                logging.info("  ... and %d more", remaining)
-
+            print(f"  Success rate:{pad('Success rate:')}{success_rate:.1f}%")
         print("=" * 70)
-        logging.info("=" * 70)
-
         # Save detailed report
         report_file = self.base_path / f"validation_summary.txt"
         with open(report_file, 'w', encoding='utf-8') as f:
@@ -541,48 +434,43 @@ class GooglePhotosValidator:
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Input path: {self.base_path}\n")
             f.write(f"Output path: {self.output_path}\n\n")
-            
-            f.write("SUMMARY:\n")
-            f.write(f"Total input files: {self.result.total_input_files}\n")
-            f.write(f"Found in output: {self.result.found_in_output}\n")
-            f.write(f"Size matches: {self.result.content_matches}\n")
-            f.write(f"Size mismatches: {self.result.content_mismatches}\n")
-            f.write(f"Missing files: {len(self.result.missing_files)}\n")
-            f.write(f"Errors: {len(self.result.errors)}\n\n")
-            
-            if self.result.missing_files:
-                f.write("MISSING FILES:\n")
-                for missing in self.result.missing_files:
-                    f.write(f"{missing}\n")
-                f.write("\n")
-            
-            if self.result.mismatch_files:
-                f.write("SIZE MISMATCHES:\n")
-                for input_file, output_file, reason in self.result.mismatch_files:
-                    f.write(f"Input:  {input_file}\n")
-                    f.write(f"Output: {output_file}\n")
-                    f.write(f"Reason: {reason}\n\n")
-            
-            if self.result.errors:
-                f.write("ERRORS:\n")
-                for error in self.result.errors:
-                    f.write(f"{error}\n")
-
+            f.write("OVERALL SUMMARY:\n")
+            f.write(f"Total media files: {self.result.total_input_files}\n")
+            f.write(f"Test 1: Output files not present: {len(self.result.missing_files)}\n")
+            f.write(f"Test 2: Output file size mismatch: {self.result.content_mismatches}\n")
+            f.write(f"Test 3: Output file modified date invalid: {self.result.invalid_date_files}\n")
+            f.write(f"Test 4: Orphan JSON files: {self.result.orphan_json_files}\n")
+            f.write(f"Errors: {len(self.result.errors)}\n")
+            if self.result.total_input_files > 0:
+                f.write(f"Success rate: {success_rate:.1f}%\n\n")
         print(f"Detailed report saved to: {report_file}")
-        logging.info("Detailed report saved to: %s", report_file)
+        print("Note: Overall missing files may differ from per-year missing files if a file is not matched to any year folder, or if output path calculation fails for a file present in input but not in any year folder.")
+        # Write missing files not accounted to any year folder
+        if hasattr(self.result, 'per_year_missing_files'):
+            per_year_missing = set(self.result.per_year_missing_files)
+            unaccounted_missing = [f for f in self.result.missing_files if f not in per_year_missing]
+            if unaccounted_missing:
+                unaccounted_file = self.base_path / "unaccounted_missing_files.txt"
+                with open(unaccounted_file, 'w', encoding='utf-8') as f:
+                    f.write("Missing files not accounted to any year folder\n")
+                    f.write("=" * 50 + "\n")
+                    for fname in unaccounted_missing:
+                        f.write(f"{fname}\n")
+                print(f"Unaccounted missing files written to: {unaccounted_file}")
 
 def main():
     parser = argparse.ArgumentParser(description='Validate Google Photos processor output (file size comparison)')
     parser.add_argument('input_path', help='Path to the Google Photos takeout folder')
     parser.add_argument('-o', '--output', help='Path to processed output folder (default: input_path/processed)')
     parser.add_argument('--wait', action='store_true', help='Pause after each year summary')
+    parser.add_argument('--time-zone', default=DEFAULT_TZ, help='Time zone for date conversion (default: America/Los_Angeles)')
     args = parser.parse_args()
     base_path = Path(args.input_path).resolve()
     output_path = Path(args.output).resolve() if args.output else None
     if not base_path.exists():
         print(f"Error: Input path does not exist: {base_path}")
         sys.exit(1)
-    validator = GooglePhotosValidator(base_path, output_path)
+    validator = GooglePhotosValidator(base_path, output_path, time_zone=args.time_zone)
     validator.validate(wait=args.wait)
     sys.exit(0)
 
